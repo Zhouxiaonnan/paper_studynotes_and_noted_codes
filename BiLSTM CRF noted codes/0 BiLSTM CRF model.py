@@ -50,12 +50,12 @@ class BiLSTM_CRF(nn.Module):
         self.embedding_dim = embedding_dim    # word embedding dim
         self.hidden_dim = hidden_dim          # Bi-LSTM hidden dim
         self.vocab_size = vocab_size          # 词表大小
-        self.tag_to_ix = tag_to_ix            # 标签2id
+        self.tag_to_ix = tag_to_ix            # 标签2id BEIOS -> id
         self.tagset_size = len(tag_to_ix)     # 标签的数量
 
         self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
         self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2, # 因为之后要进行正反方向的concat
-                            num_layers=1, bidirectional=True)
+                            num_layers = 1, bidirectional = True)
 
         # Maps the output of the LSTM into tag space.
         # 将BiLSTM提取的特征向量映射到特征空间，即经过全连接得到发射分数
@@ -63,6 +63,7 @@ class BiLSTM_CRF(nn.Module):
 
         # Matrix of transition parameters.  Entry i,j is the score of transitioning *to* i *from* j.
         # 转移矩阵的参数初始化，transitions[i,j]代表的是从第j个tag转移到第i个tag的转移分数
+        # torch.randn：从标准正态分布中产生随机数 tagset_size * tagset_size
         self.transitions = nn.Parameter(
             torch.randn(self.tagset_size, self.tagset_size))
 
@@ -78,35 +79,44 @@ class BiLSTM_CRF(nn.Module):
     # 初始化LSTM的参数
     def init_hidden(self):
         
-        return (torch.randn(2, 1, self.hidden_dim // 2), # torch.randn：从标准正态分布中产生随机数 2 * 1 * (hidden_dim // 2)
+        # torch.randn：从标准正态分布中产生随机数 2 * 1 * (hidden_dim // 2)
+        # 正向 hidden state + cell state，反向 hidden state + cell state
+        return (torch.randn(2, 1, self.hidden_dim // 2), 
                 torch.randn(2, 1, self.hidden_dim // 2))
     
     # 初始化LSTM的参数
     def _get_lstm_features(self, sentence):
         
-        self.hidden = self.init_hidden() # 初始化hidden_state
-        embeds = self.word_embeds(sentence).view(len(sentence), 1, -1) # batch_size * sentence_length * embedding_size 
+        self.hidden = self.init_hidden() # 初始化 hidden_state
+        
+        # 维度转换（lstm必须输入三维数据），sentence_length * 1 * embedding_size
+        embeds = self.word_embeds(sentence).view(len(sentence), 1, -1) 
+        
+#         pytorch: sentence_length * batch_size * embedding_size
+#         tensorflow: batch_size * sentence_size * embedding_size
         
         # lstm_out：每个时间步的输出，self.hidden：最后一个时间步的输出
-        # lstm_out：batch_size * sentence_length * hidden_dim（双向LSTM，正向和反向的hidden state进行concat）
+        # lstm_out：sentence_length * 1 * hidden_dim（双向LSTM，正向和反向的hidden state进行concat）
         lstm_out, self.hidden = self.lstm(embeds, self.hidden) 
-        lstm_out = lstm_out.view(len(sentence), self.hidden_dim)
-        lstm_feats = self.hidden2tag(lstm_out) # 全连接层 batch_size * sentence_length * tagset_size
+        lstm_out = lstm_out.view(len(sentence), self.hidden_dim) # 维度转换（全连接层必须输入二维数据） sentence_length * hidden_dim
+        lstm_feats = self.hidden2tag(lstm_out) # 全连接层 sentence_length * tagset_size
         return lstm_feats # 发射分数，每个单词都有 tagset_size 个发射分数
     
-    # 计算一条路径的分数
+    # 计算一条路径的分数，用来计算最优路径的分数
     def _score_sentence(self, feats, tags):
         
         # Gives the score of a provided tag sequence
         # 计算给定tag序列的分数，即一条路径的分数
         score = torch.zeros(1)
         tags = torch.cat([torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long), tags]) # 在tags开头接上start的id
-        for i, feat in enumerate(feats): # 每个时间步
+        for i, feat in enumerate(feats): # 每个时间步，每个时间步对应 tagset_size 个发射分数
             
             # 递推计算路径分数：转移分数 + 发射分数
             # 从时间步 i 转移到时间步 i+1 的转移分数 + i+1 时间步的发射分数
             # tags[0]是start，而feats不是从start开始的，所以这里发射分数是用feat[tags[i+1]]
-            score = score + self.transitions[tags[i + 1], tags[i]] + feat[tags[i + 1]] 
+            score = score + # 之前的score
+                    self.transitions[tags[i + 1], tags[i]] + # 当前步的转移score
+                    feat[tags[i + 1]] # 当前步的发射score
         score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[-1]] # 最后加上转移到stop的分数
         return score # 一条路径的分数
     
@@ -155,14 +165,14 @@ class BiLSTM_CRF(nn.Module):
                 # 对所有的tag进行计算后，得到的alphas_t的形状是 1 * tagset_size，表示当前步的score
                 alphas_t.append(log_sum_exp(next_tag_var).view(1))
                 
-            # 更新previous 递推计算下一个时间步
+            # 更新 previous 递推计算下一个时间步
             # torch.cat：拼接
             previous = torch.cat(alphas_t).view(1, -1)
             
         # 考虑最终转移到STOP_TAG
         terminal_var = previous + self.transitions[self.tag_to_ix[STOP_TAG]]
         
-        # 计算最终的分数
+        # 计算最终的分数（所有路径的分数之和）
         scores = log_sum_exp(terminal_var)
         return scores
 
@@ -194,7 +204,7 @@ class BiLSTM_CRF(nn.Module):
                 # We don't include the emission scores here because the max
                 # does not depend on them (we add them in below)
                 # 维特比算法记录最优路径时只考虑上一步的分数以及上一步tag转移到当前tag的转移分数
-                # 并不取决与当前tag的发射分数
+                # 并不取决与当前tag的发射分数，因为对于同一个next_tag，每个路径都要乘以相同的发射分数，对于对比路径来说没有作用
                 # 如果有三个tag，这里算的是前一步的三个tag到达下一步的一个tag的分数
                 # 即tag1,tag2,tag3到达tag1的分数，在内层循环中再计算三个tag到tag2的分数，以及三个tag到tag3的分数
                 next_tag_var = previous + self.transitions[next_tag] # 三个分数
@@ -273,7 +283,7 @@ word_to_ix = {}
 for sentence, tags in training_data:
     for word in sentence:
         if word not in word_to_ix:
-            word_to_ix[word] = len(word_to_ix)
+            word_to_ix[word] = len(word_to_ix) # 字2id表
 
 tag_to_ix = {"B": 0, "I": 1, "O": 2, START_TAG: 3, STOP_TAG: 4}
 
